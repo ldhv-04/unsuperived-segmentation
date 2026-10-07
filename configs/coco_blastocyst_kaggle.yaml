@@ -1,0 +1,31 @@
+# ==============================================================================
+# CẤU HÌNH HUẤN LUYỆN BÁN GIÁM SÁT TASDF TRÊN KAGGLE (1 KÊNH)
+# ==============================================================================
+
+stage: "coco_blastocyst"
+
+model:
+  in_channels: 1
+  base_channels: 64
+  num_classes: 5
+  k_iters: 10
+
+loss:
+  lambda_topo: 0.10
+  gamma: 0.5
+  alpha: 1.0
+  max_epochs: 30
+
+# CẤU HÌNH BỘ DỮ LIỆU KAGGLE
+dataset:
+  type: "coco"
+  root_dir: "/kaggle/input/datasets/toilatoan2409/test-dataset"
+  image_size: 256
+  labeled_ratio: 0.2
+
+training:
+  batch_size: 4
+  learning_rate: 0.0001
+  weight_decay: 0.00005
+  checkpoint_dir: "checkpoints"
+  log_interval: 20

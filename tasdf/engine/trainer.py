@@ -1,0 +1,244 @@
+import os
+from pathlib import Path
+import shutil
+from typing import Any
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from tasdf.losses import MainLoss
+from tasdf.utils.metrics import (
+    compute_multiclass_dice,
+    get_model_parameter_stats,
+    format_parameter_summary,
+)
+from .logger import DualLogger
+
+
+class Trainer:
+    """
+    Trình điều phối huấn luyện bán giám sát TASDF:
+    - Hỗ trợ Automatic Mixed Precision (AMP FP16)
+    - Tích hợp Gradient Accumulation
+    - Lưu và khôi phục trạng thái toàn vẹn (Fault-Tolerant Checkpointing)
+    - Giám sát kép Text + JSON
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: dict[str, Any],
+        logger: DualLogger | None = None,
+        checkpoint_dir: str | Path | None = None,
+    ):
+        self.cfg = cfg
+        train_cfg = cfg.get("training", {})
+        loss_cfg = cfg.get("loss", {})
+
+        # 1. Cấu hình thiết bị & AMP
+        req_device = train_cfg.get("device")
+        if req_device:
+            self.device = torch.device(req_device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = model.to(self.device)
+        self.use_amp = bool(train_cfg.get("amp", True) and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
+        # 2. Tối ưu hóa & Hàm mất mát
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=float(train_cfg.get("learning_rate", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 5e-5)),
+        )
+        self.criterion = MainLoss(
+            lambda_topo=float(loss_cfg.get("lambda_topo", 0.10)),
+            gamma=float(loss_cfg.get("gamma", 0.5)),
+            alpha=float(loss_cfg.get("alpha", 1.0)),
+            max_epochs=int(loss_cfg.get("max_epochs", 50)),
+        )
+
+        # 3. Thư mục checkpoint & nhật ký
+        ckpt_path = checkpoint_dir or train_cfg.get("checkpoint_dir", "checkpoints")
+        self.checkpoint_dir = Path(ckpt_path)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger = logger or DualLogger(self.checkpoint_dir.parent / "logs")
+
+        # 4. Trạng thái vòng đời
+        self.start_epoch = 1
+        self.best_val_dice = 0.0
+        self.accum_steps = int(train_cfg.get("accum_steps", 1))
+        self.log_interval = int(train_cfg.get("log_interval", 20))
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False, custom_name: str | None = None):
+        """Lưu trạng thái toàn diện vào file checkpoint."""
+        state = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "best_val_dice": self.best_val_dice,
+            "config": self.cfg,
+        }
+
+        # Lưu checkpoint_latest.pt và tạo alias (latest.pt, last.pt)
+        latest_file = self.checkpoint_dir / "checkpoint_latest.pt"
+        torch.save(state, str(latest_file))
+        for alias in ["latest.pt", "last.pt"]:
+            alias_path = self.checkpoint_dir / alias
+            if alias_path.exists() or alias_path.is_symlink():
+                alias_path.unlink()
+            try:
+                os.link(str(latest_file), str(alias_path))
+            except OSError:
+                shutil.copyfile(str(latest_file), str(alias_path))
+
+        # Lưu checkpoint_best.pt và tạo alias (best.pt) nếu đạt kỷ lục
+        if is_best:
+            best_file = self.checkpoint_dir / "checkpoint_best.pt"
+            torch.save(state, str(best_file))
+            alias_path = self.checkpoint_dir / "best.pt"
+            if alias_path.exists() or alias_path.is_symlink():
+                alias_path.unlink()
+            try:
+                os.link(str(best_file), str(alias_path))
+            except OSError:
+                shutil.copyfile(str(best_file), str(alias_path))
+
+        if custom_name:
+            custom_file = self.checkpoint_dir / custom_name
+            torch.save(state, str(custom_file))
+
+    def load_checkpoint(self, checkpoint_path: str | Path, resume: bool = True):
+        """Nạp checkpoint và khôi phục trạng thái huấn luyện."""
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy checkpoint: {path}")
+
+        ckpt = torch.load(str(path), map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+
+        if resume:
+            if "optimizer_state_dict" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scaler_state_dict" in ckpt and self.use_amp:
+                self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+            self.start_epoch = ckpt.get("epoch", 0) + 1
+            self.best_val_dice = ckpt.get("best_val_dice", 0.0)
+            self.logger.log_message(
+                f">> Tiếp tục huấn luyện từ Epoch {self.start_epoch} (Best Dice trước đó: {self.best_val_dice * 100:.2f}%)"
+            )
+        else:
+            self.logger.log_message(f">> Đã nạp thành công trọng số mô hình từ {path}")
+
+    def train_one_epoch(
+        self,
+        labeled_loader: DataLoader,
+        unlabeled_loader: DataLoader,
+        epoch: int,
+    ) -> dict[str, float]:
+        """Huấn luyện một epoch đơn lẻ."""
+        self.model.train()
+        labeled_iter = iter(labeled_loader)
+        total_loss_accum, sup_accum, distill_accum, steps = 0.0, 0.0, 0.0, 0
+        total_steps = len(unlabeled_loader)
+
+        self.optimizer.zero_grad()
+
+        for step, x_u in enumerate(unlabeled_loader, 1):
+            try:
+                x_l, y_l = next(labeled_iter)
+            except StopIteration:
+                labeled_iter = iter(labeled_loader)
+                x_l, y_l = next(labeled_iter)
+
+            x_l, y_l = x_l.to(self.device), y_l.to(self.device)
+            x_u = x_u.to(self.device)
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                (p1_l, _), (p2_l, _) = self.model(x_l, branch="both")
+                (p1_u, t1_u), (p2_u, t2_u) = self.model(x_u, branch="both")
+
+                loss, metrics = self.criterion(
+                    p1_l, p2_l, y_l, p1_u, p2_u, t1_u, t2_u, current_epoch=epoch
+                )
+                loss_step = loss / self.accum_steps
+
+            self.scaler.scale(loss_step).backward()
+
+            if step % self.accum_steps == 0 or step == total_steps:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+
+            distill_val = metrics["loss_pc"] + self.criterion.lambda_topo * metrics["loss_tc"]
+            total_loss_accum += metrics["total_loss"]
+            sup_accum += metrics["loss_sup"]
+            distill_accum += distill_val
+            steps += 1
+
+        return {
+            "total_loss": total_loss_accum / max(1, steps),
+            "loss_sup": sup_accum / max(1, steps),
+            "loss_distill": distill_accum / max(1, steps),
+        }
+
+    def train(
+        self,
+        labeled_loader: DataLoader,
+        unlabeled_loader: DataLoader,
+        val_loader: DataLoader | None = None,
+        validator: Any | None = None,
+        epochs: int | None = None,
+    ) -> dict[str, Any]:
+        """Vòng lặp huấn luyện chính."""
+        total_epochs = epochs or self.cfg.get("training", {}).get("epochs", 30)
+
+        # 1. Thống kê và hiển thị số lượng tham số trước khi huấn luyện
+        param_stats = get_model_parameter_stats(self.model)
+        self.logger.log_message("\n" + format_parameter_summary(param_stats))
+
+        self.logger.log_message(
+            f"Bắt đầu huấn luyện: Epoch {self.start_epoch} -> {total_epochs} | Thiết bị: {self.device} | AMP: {self.use_amp}"
+        )
+        self.logger.log_header()
+
+        for epoch in range(self.start_epoch, total_epochs + 1):
+            train_metrics = self.train_one_epoch(labeled_loader, unlabeled_loader, epoch)
+
+            val_mDice = 0.0
+            per_class_dice = {}
+            if validator:
+                val_res = validator.validate(self.model)
+                val_mDice = val_res.get("mDice", 0.0)
+                per_class_dice = val_res.get("per_class_dice", {})
+
+            # Tổng hợp metrics gửi logger
+            epoch_data = {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "train_total_loss": train_metrics["total_loss"],
+                "train_loss_sup": train_metrics["loss_sup"],
+                "train_loss_distill": train_metrics["loss_distill"],
+                "val_mDice": val_mDice,
+                "per_class_dice": per_class_dice,
+            }
+            self.logger.log_epoch(epoch_data)
+
+            # Cập nhật checkpoint
+            is_best = val_mDice > self.best_val_dice
+            if is_best:
+                self.best_val_dice = val_mDice
+            self.save_checkpoint(epoch, is_best=is_best)
+
+        best_ckpt = self.checkpoint_dir / "checkpoint_best.pt"
+        latest_ckpt = self.checkpoint_dir / "checkpoint_latest.pt"
+
+        return {
+            "best_checkpoint": str(best_ckpt if best_ckpt.exists() else latest_ckpt),
+            "latest_checkpoint": str(latest_ckpt),
+            "metrics_path": str(self.logger.json_file),
+            "best_val_dice": self.best_val_dice,
+        }

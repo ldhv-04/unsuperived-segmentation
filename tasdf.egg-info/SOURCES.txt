@@ -1,0 +1,17 @@
+pyproject.toml
+tasdf.egg-info/PKG-INFO
+tasdf.egg-info/SOURCES.txt
+tasdf.egg-info/dependency_links.txt
+tasdf.egg-info/entry_points.txt
+tasdf.egg-info/requires.txt
+tasdf.egg-info/top_level.txt
+tests/test_builder.py
+tests/test_coco_dataset.py
+tests/test_dual_heads.py
+tests/test_eval.py
+tests/test_final_model.py
+tests/test_inference.py
+tests/test_itgm.py
+tests/test_losses.py
+tests/test_unet_backbone.py
+tests/test_unet_blocks.py

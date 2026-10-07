@@ -1,0 +1,25 @@
+# ==============================================================================
+# CẤU HÌNH HUẤN LUYỆN BÁN GIÁM SÁT TASDF - PHÔI NANG NGÀY 5-6 (BLASTOCYST)
+# ==============================================================================
+
+stage: "day5_blastocyst"
+
+model:
+  in_channels: 1
+  base_channels: 64
+  num_classes: 5
+  k_iters: 10
+
+loss:
+  lambda_topo: 0.10
+  gamma: 0.5
+  alpha: 1.0
+  max_epochs: 100
+
+training:
+  batch_size: 2
+  learning_rate: 0.0001
+  weight_decay: 0.00005
+  image_size: 256
+  data_dir: "/home/terminator/workspace/Attech/Research/dataset/ICM Blastocyst"
+  checkpoint_dir: "checkpoints"
