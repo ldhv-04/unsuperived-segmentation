@@ -64,6 +64,10 @@ class Trainer:
         self.checkpoint_dir = Path(ckpt_path)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        # Thư mục gốc bổ sung (đồng bộ ra checkpoints/ toàn cục nếu người dùng cấu hình)
+        configured_dir = train_cfg.get("checkpoint_dir")
+        self.root_checkpoint_dir = Path(configured_dir) if configured_dir else Path("checkpoints")
+
         self.logger = logger or DualLogger(self.checkpoint_dir.parent / "logs")
 
         # 4. Trạng thái vòng đời
@@ -73,7 +77,12 @@ class Trainer:
         self.log_interval = int(train_cfg.get("log_interval", 20))
 
     def save_checkpoint(self, epoch: int, is_best: bool = False, custom_name: str | None = None):
-        """Lưu trạng thái toàn diện vào file checkpoint."""
+        """
+        Lưu trạng thái toàn diện vào file checkpoint.
+        Đảm bảo luôn xuất 2 checkpoint chuẩn:
+          1. best.pt: Trọng số mô hình có điểm validation tốt nhất (hoặc epoch 1).
+          2. last.pt: Trọng số mô hình ở epoch gần nhất.
+        """
         state = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -83,29 +92,52 @@ class Trainer:
             "config": self.cfg,
         }
 
-        # Lưu checkpoint_latest.pt và tạo alias (latest.pt, last.pt)
-        latest_file = self.checkpoint_dir / "checkpoint_latest.pt"
-        torch.save(state, str(latest_file))
-        for alias in ["latest.pt", "last.pt"]:
+        # 1. Luôn lưu last.pt ở mỗi epoch
+        last_file = self.checkpoint_dir / "last.pt"
+        torch.save(state, str(last_file))
+
+        # Lưu alias tương thích ngược (latest.pt, checkpoint_latest.pt)
+        for alias in ["latest.pt", "checkpoint_latest.pt"]:
             alias_path = self.checkpoint_dir / alias
             if alias_path.exists() or alias_path.is_symlink():
                 alias_path.unlink()
             try:
-                os.link(str(latest_file), str(alias_path))
+                os.link(str(last_file), str(alias_path))
             except OSError:
-                shutil.copyfile(str(latest_file), str(alias_path))
+                shutil.copyfile(str(last_file), str(alias_path))
 
-        # Lưu checkpoint_best.pt và tạo alias (best.pt) nếu đạt kỷ lục
-        if is_best:
-            best_file = self.checkpoint_dir / "checkpoint_best.pt"
+        # 2. Lưu best.pt nếu đạt kỷ lục hoặc lần lưu đầu tiên
+        best_file = self.checkpoint_dir / "best.pt"
+        if is_best or not best_file.exists():
             torch.save(state, str(best_file))
-            alias_path = self.checkpoint_dir / "best.pt"
-            if alias_path.exists() or alias_path.is_symlink():
-                alias_path.unlink()
+            alias_best = self.checkpoint_dir / "checkpoint_best.pt"
+            if alias_best.exists() or alias_best.is_symlink():
+                alias_best.unlink()
             try:
-                os.link(str(best_file), str(alias_path))
+                os.link(str(best_file), str(alias_best))
             except OSError:
-                shutil.copyfile(str(best_file), str(alias_path))
+                shutil.copyfile(str(best_file), str(alias_best))
+
+        # 3. Đồng bộ best.pt và last.pt sang các thư mục đích bổ sung
+        target_dirs = []
+        if hasattr(self, "root_checkpoint_dir") and self.root_checkpoint_dir:
+            if self.root_checkpoint_dir.resolve() != self.checkpoint_dir.resolve():
+                target_dirs.append(self.root_checkpoint_dir)
+
+        # Nếu checkpoint_dir là 'weights', đồng bộ thêm sang 'checkpoints' cùng cấp và ngược lại
+        sibling_name = "checkpoints" if self.checkpoint_dir.name == "weights" else "weights"
+        sibling_dir = self.checkpoint_dir.parent / sibling_name
+        if sibling_dir.resolve() != self.checkpoint_dir.resolve():
+            target_dirs.append(sibling_dir)
+
+        for out_dir in target_dirs:
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(str(last_file), str(out_dir / "last.pt"))
+                if best_file.exists():
+                    shutil.copyfile(str(best_file), str(out_dir / "best.pt"))
+            except Exception:
+                pass
 
         if custom_name:
             custom_file = self.checkpoint_dir / custom_name
@@ -227,18 +259,21 @@ class Trainer:
             }
             self.logger.log_epoch(epoch_data)
 
-            # Cập nhật checkpoint
-            is_best = val_mDice > self.best_val_dice
-            if is_best:
+            # Cập nhật checkpoint: Epoch đầu tiên hoặc khi mDice cải thiện đều lưu best
+            is_best = (val_mDice > self.best_val_dice) or (epoch == self.start_epoch)
+            if val_mDice > self.best_val_dice:
                 self.best_val_dice = val_mDice
             self.save_checkpoint(epoch, is_best=is_best)
 
-        best_ckpt = self.checkpoint_dir / "checkpoint_best.pt"
-        latest_ckpt = self.checkpoint_dir / "checkpoint_latest.pt"
+        best_ckpt = self.checkpoint_dir / "best.pt"
+        last_ckpt = self.checkpoint_dir / "last.pt"
+        if not best_ckpt.exists() and last_ckpt.exists():
+            shutil.copyfile(str(last_ckpt), str(best_ckpt))
 
         return {
-            "best_checkpoint": str(best_ckpt if best_ckpt.exists() else latest_ckpt),
-            "latest_checkpoint": str(latest_ckpt),
+            "best_checkpoint": str(best_ckpt),
+            "last_checkpoint": str(last_ckpt),
+            "latest_checkpoint": str(last_ckpt),
             "metrics_path": str(self.logger.json_file),
             "best_val_dice": self.best_val_dice,
         }

@@ -173,6 +173,7 @@ class TASDF:
         loader = DataLoader(val_ds, batch_size=batch, shuffle=False)
 
         dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(dev)
         validator = Validator(
             val_loader=loader,
             device=dev,
@@ -198,6 +199,7 @@ class TASDF:
     ) -> list[dict[str, Any]]:
         """Suy luận trực quan trên ảnh phôi bất kỳ."""
         dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(dev)
         predictor = Predictor(
             image_size=imgsz,
             device=dev,

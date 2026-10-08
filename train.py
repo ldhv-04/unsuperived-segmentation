@@ -56,7 +56,9 @@ def main():
         amp=args.amp,
         **kwargs,
     )
-    print(f"\n[+] Huấn luyện hoàn tất! Best checkpoint lưu tại: {results['best_checkpoint']}")
+    print(f"\n[+] Huấn luyện hoàn tất! Checkpoints lưu tại:")
+    print(f"    - Best: {results['best_checkpoint']}")
+    print(f"    - Last: {results['last_checkpoint']}")
 
 
 if __name__ == "__main__":

@@ -51,8 +51,46 @@ def test_trainer_one_epoch_and_checkpoint(dummy_model, dummy_loaders, tmp_path: 
     trainer.save_checkpoint(epoch=1, is_best=True)
     assert (tmp_path / "checkpoints" / "checkpoint_latest.pt").exists()
     assert (tmp_path / "checkpoints" / "checkpoint_best.pt").exists()
+    assert (tmp_path / "checkpoints" / "best.pt").exists()
+    assert (tmp_path / "checkpoints" / "last.pt").exists()
 
     # Test nạp lại checkpoint (Resume)
     new_trainer = Trainer(dummy_model, cfg, logger=logger, checkpoint_dir=tmp_path / "checkpoints")
-    new_trainer.load_checkpoint(tmp_path / "checkpoints" / "checkpoint_latest.pt", resume=True)
+    new_trainer.load_checkpoint(tmp_path / "checkpoints" / "last.pt", resume=True)
     assert new_trainer.start_epoch == 2
+
+
+def test_trainer_exports_best_and_last_pt(dummy_model, dummy_loaders, tmp_path: Path):
+    """Kiểm tra chu trình huấn luyện luôn tạo ra chính xác best.pt và last.pt."""
+    l_loader, u_loader = dummy_loaders
+    root_ckpt = tmp_path / "global_checkpoints"
+    cfg = {
+        "training": {
+            "device": "cpu",
+            "amp": False,
+            "learning_rate": 1e-3,
+            "accum_steps": 1,
+            "epochs": 2,
+            "checkpoint_dir": str(root_ckpt),
+        },
+        "loss": {"lambda_topo": 0.1, "gamma": 0.5, "alpha": 1.0, "max_epochs": 2},
+    }
+
+    local_ckpt = tmp_path / "runs" / "exp" / "weights"
+    logger = DualLogger(output_dir=tmp_path / "runs" / "exp" / "logs")
+    trainer = Trainer(dummy_model, cfg, logger=logger, checkpoint_dir=local_ckpt)
+
+    results = trainer.train(l_loader, u_loader, epochs=2)
+
+    # 1. Kiểm tra file tại thư mục cục bộ của phiên chạy
+    assert (local_ckpt / "best.pt").exists()
+    assert (local_ckpt / "last.pt").exists()
+
+    # 2. Kiểm tra file được đồng bộ sang thư mục checkpoints cấu hình toàn cục
+    assert (root_ckpt / "best.pt").exists()
+    assert (root_ckpt / "last.pt").exists()
+
+    # 3. Kiểm tra kết quả trả về trong từ điển kết quả
+    assert results["best_checkpoint"] == str(local_ckpt / "best.pt")
+    assert results["last_checkpoint"] == str(local_ckpt / "last.pt")
+

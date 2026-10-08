@@ -79,6 +79,8 @@ def test_api_workflow_jupyter_style(api_synthetic_coco: Path, tmp_path: Path):
     assert (exp_dir / "train.log").exists()
     assert (exp_dir / "metrics.json").exists()
     assert (exp_dir / "checkpoints" / "latest.pt").exists()
+    assert (exp_dir / "checkpoints" / "best.pt").exists()
+    assert (exp_dir / "checkpoints" / "last.pt").exists()
 
     # 3. Đánh giá (Val)
     val_res = model.val(data=data_dict, imgsz=32, batch=2)
